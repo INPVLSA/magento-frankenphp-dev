@@ -2,44 +2,40 @@ services:
   frankenphp84:
     container_name: frankenphp84
     hostname: frankenphp84
-    working_dir: /var/www/vhosts/8.4
+    working_dir: /app
     image: local/frankenphp:8.4
     build:
-      context: ./Dockerfiles
+      context: ./dev/franken/docker/Dockerfiles
       dockerfile: frankenPhp.Dockerfile
     volumes:
-      - ./data/8.4:/var/www/vhosts/8.4:delegated
+      - ./:/app:delegated
       - composer-cache:/home/magento/.composer
-      # mounting frankenphp configuration files, read-only
-      - ./docker-files/franken/franken:/etc/frankenphp:ro
-      # mounting additional PHP configuration files, read-only
-      - ./docker-files/php/conf.d/magento.ini:/usr/local/etc/php/conf.d/zz-magento.ini:ro
-      - ./docker-files/php/conf.d/opcache.ini:/usr/local/etc/php/conf.d/zz-opcache.ini:ro
-      - ./docker-files/php/conf.d/xdebug.ini:/usr/local/etc/php/conf.d/zz-xdebug.ini:ro
-      - ./docker-files/Caddyfile.worker:/etc/caddy/Caddyfile:ro
-      - ./docker-files/frankenphp/dev-reload.js:/etc/caddy/dev-reload.js:ro
-    dns:
-      - 172.20.0.100
+      # PHP config
+      - ./dev/franken/docker/docker-files/php/conf.d/magento.ini:/usr/local/etc/php/conf.d/zz-magento.ini:ro
+      - ./dev/franken/docker/docker-files/php/conf.d/opcache.ini:/usr/local/etc/php/conf.d/zz-opcache.ini:ro
+      - ./dev/franken/docker/docker-files/php/conf.d/xdebug.ini:/usr/local/etc/php/conf.d/zz-xdebug.ini:ro
+      # Caddy config (swap to Caddyfile.classic for non-worker mode)
+      - ./dev/franken/docker/docker-files/caddy/Caddyfile.worker:/etc/caddy/Caddyfile:ro
     ports:
       - "80:80"
-      - "443:443"w
+      - "443:443"
       - "443:443/udp"
     environment:
       - XDEBUG_MODE=off
       - XDEBUG_CONFIG
       - PHP_IDE_CONFIG
     extra_hosts:
-      - ${host:-host.docker.internal}:host-gateway
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - franken-magento
+
+volumes:
+  composer-cache:
 
 networks:
   default:
-    ipam:
-      driver: default
-      config:
-        - subnet: 172.20.0.0/24
-          gateway: 172.20.0.1
-
-volumes:
-  mysql8:
-  opensearch-data:
-  composer-cache:
+  # Shared network with your DB / Redis / OpenSearch stack.
+  # Create it once on the host:  docker network create franken-magento
+  franken-magento:
+    external: true
