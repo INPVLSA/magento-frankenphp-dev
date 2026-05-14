@@ -1,0 +1,158 @@
+{
+	frankenphp {
+		worker {
+			file /app/pub/frankenphp-worker.php
+			num 4
+			env MAX_REQUESTS 500
+			# Hot-reload the worker when custom code/themes change.
+			# Scoped to app/ to avoid inotify storms from vendor/ and generated/.
+			watch /app/app/code/**/*.php
+			watch /app/app/design/**/*.php
+		}
+	}
+	order php_server before file_server
+	order mercure after encode
+	order route first
+	admin off
+	auto_https off
+	servers {
+		protocols h1 h2 h2c h3
+	}
+}
+
+# Redirect plain HTTP to HTTPS
+http://magento.loc {
+	redir https://{host}{uri} permanent
+}
+
+magento.loc {
+	tls /etc/caddy/certs.d/magento.loc/ssl_certificate.cert /etc/caddy/certs.d/magento.loc/id_rsa.key
+
+	root * /app/pub
+	encode zstd gzip
+
+	# ─── Mercure hub (SSE) ───
+	# Wrapped in `route` so it runs ahead of Magento's `try_files` rewrite
+	# (the global `order route first` puts route blocks before everything else).
+	# Dev keys — DO NOT use in production.
+	route /.well-known/mercure* {
+		mercure {
+			publisher_jwt !ChangeThisMercureHubJWTSecretKey! HS256
+			subscriber_jwt !ChangeThisMercureHubJWTSecretKey! HS256
+			anonymous
+			cors_origins https://magento.loc http://magento.loc
+			publish_origins https://magento.loc http://magento.loc
+		}
+	}
+
+	# ─── Dev reload snippet (subscribes to Mercure, reloads tab on publish) ───
+	# Include in your theme with: <script src="/dev-reload.js"></script>
+	route /dev-reload.js {
+		root * /etc/caddy
+		header Content-Type "application/javascript; charset=utf-8"
+		header Cache-Control "no-store"
+		file_server
+	}
+
+	# ─── Deny rules (order matters: most specific first) ───
+	@denied_paths path /.user.ini /media/customer/* /media/downloadable/* /media/import/* /media/custom_options/*
+	@denied_media_theme path_regexp denied_media_theme ^/media/theme_customization/.*\.xml$
+	@denied_pub_media path_regexp denied_pub_media ^/pub/media/(downloadable|customer|import|custom_options)(/.*)?$
+	@denied_pub_media_theme path_regexp denied_pub_media_theme ^/pub/media/theme_customization/.*\.xml$
+	@denied_errors_xml path_regexp denied_errors_xml ^/errors/.*\.xml$
+	@denied_setup {
+		path /setup/*
+		not path /setup/pub/*
+	}
+	@denied_update {
+		path /update/*
+		not path /update/pub/*
+	}
+	respond @denied_paths 403
+	respond @denied_media_theme 403
+	respond @denied_pub_media 403
+	respond @denied_pub_media_theme 403
+	respond @denied_errors_xml 403
+	respond @denied_setup 403
+	respond @denied_update 403
+
+	# ─── Static assets with versioning rewrite ───
+	# Caddy groups *consecutive* `rewrite` directives — only the first match
+	# fires per request. To run the version-strip AND the missing-file
+	# rewrite on the same request (needed for /static/versionXXX/<missing>),
+	# we put the version-strip inside its own `route { }` so it lives in a
+	# separate group from the @static_missing rewrite below.
+	route {
+		@static_versioned path_regexp static ^/static/version\d+/(.*)$
+		rewrite @static_versioned /static/{http.regexp.static.1}
+	}
+
+	@static_missing {
+		path_regexp static_missing ^/static/(.*)$
+		not file
+	}
+	rewrite @static_missing /static.php?resource={http.regexp.static_missing.1}
+
+	@media_missing {
+		path /media/*
+		not file
+	}
+	rewrite @media_missing /get.php?{query}
+
+	# Cache headers for static assets
+	@cacheable path_regexp \.(ico|jpg|jpeg|png|gif|svg|js|css|swf|eot|ttf|otf|woff|woff2|html|json)$
+	header @cacheable {
+		Cache-Control "public, max-age=31536000"
+		X-Frame-Options "SAMEORIGIN"
+	}
+
+	@nocache path_regexp \.(zip|gz|gzip|bz2|csv|xml)$
+	header @nocache {
+		Cache-Control "no-store"
+		X-Frame-Options "SAMEORIGIN"
+	}
+
+	# ─── PHP entry points (whitelist) ───
+	@php_entrypoints path_regexp ^/(index|get|static|errors/report|errors/404|errors/503|health_check|frankenphp-worker)\.php$
+	@setup_php path /setup/index.php
+	@update_php path /update/index.php
+	@mftf_php path /dev/tests/acceptance/utils/command.php
+
+	php_server @php_entrypoints
+	php_server @setup_php {
+		root /app
+	}
+	php_server @update_php {
+		root /app
+	}
+	php_server @mftf_php {
+		root /app
+	}
+
+	# ─── Block any other PHP / sensitive files ───
+	@banned {
+		path_regexp banned \.(php|phtml|htaccess)$|\.git
+		not path /index.php /get.php /static.php /errors/report.php /errors/404.php /errors/503.php /health_check.php /frankenphp-worker.php /setup/index.php /update/index.php /dev/tests/acceptance/utils/command.php
+	}
+	respond @banned 403
+
+	# ─── Default handler ───
+	# Route all non-static, non-asset traffic to the FrankenPHP worker.
+	# Static.php / get.php / index.php fall-throughs are handled above by their
+	# own @static_missing / @media_missing / @php_entrypoints rules.
+	@root path /
+	rewrite @root /frankenphp-worker.php
+	@index_php path /index.php
+	rewrite @index_php /frankenphp-worker.php?{query}
+	try_files {path} /frankenphp-worker.php
+	php_server
+
+	# 404 fallback to Magento error page
+	handle_errors {
+		@404 expression {err.status_code} == 404
+		rewrite @404 /errors/404.php
+		php_server {
+			root /app/pub
+		}
+	}
+}

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#
+# mage-worker — wrapper around bin/magento that reloads the FrankenPHP
+# worker when the command mutated app/etc/env.php.
+#
+# Runs inside the FrankenPHP container (same context as bin/magento itself).
+# Worker reload is signaled by touching a marker file the host watches, or
+# by signaling PID 1 directly if the container has permission.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/../app/etc/env.php"
+RELOAD_MARKER="${MAGE_WORKER_RELOAD_MARKER:-$SCRIPT_DIR/../var/.mage-worker-reload}"
+
+fingerprint() {
+    if command -v md5sum >/dev/null 2>&1; then
+        md5sum < "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v md5 >/dev/null 2>&1; then
+        md5 -q "$1" 2>/dev/null
+    else
+        # last-resort: size + mtime epoch seconds
+        stat -f '%z-%m' "$1" 2>/dev/null || stat -c '%s-%Y' "$1" 2>/dev/null || echo 0
+    fi
+}
+
+before=$(fingerprint "$ENV_FILE")
+
+"$SCRIPT_DIR/magento" "$@"
+STATUS=$?
+
+after=$(fingerprint "$ENV_FILE")
+
+if [ "$STATUS" -eq 0 ] && [ "$before" != "$after" ]; then
+    # Try in-container signal first (works if FrankenPHP is PID 1 and we
+    # have permission). Fall back to touching a marker file the host or a
+    # sidecar can watch.
+    if kill -USR1 1 2>/dev/null; then
+        echo "[mage-worker] env.php changed — sent SIGUSR1 to FrankenPHP (worker reloaded)." >&2
+    else
+        : > "$RELOAD_MARKER"
+        echo "[mage-worker] env.php changed — touched $RELOAD_MARKER (host should signal worker)." >&2
+    fi
+fi
+
+exit $STATUS

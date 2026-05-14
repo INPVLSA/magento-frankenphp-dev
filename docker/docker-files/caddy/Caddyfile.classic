@@ -1,0 +1,111 @@
+{
+	frankenphp
+	order php_server before file_server
+	admin off
+	auto_https off
+	servers {
+		protocols h1 h2 h2c h3
+	}
+}
+
+# Redirect plain HTTP to HTTPS
+http://magento.loc {
+	redir https://{host}{uri} permanent
+}
+
+magento.loc {
+	tls /etc/caddy/certs.d/magento.loc/ssl_certificate.cert /etc/caddy/certs.d/magento.loc/id_rsa.key
+
+	root * /app/pub
+	encode zstd gzip
+
+	# ─── Deny rules (order matters: most specific first) ───
+	@denied_paths path /.user.ini /media/customer/* /media/downloadable/* /media/import/* /media/custom_options/*
+	@denied_media_theme path_regexp denied_media_theme ^/media/theme_customization/.*\.xml$
+	@denied_pub_media path_regexp denied_pub_media ^/pub/media/(downloadable|customer|import|custom_options)(/.*)?$
+	@denied_pub_media_theme path_regexp denied_pub_media_theme ^/pub/media/theme_customization/.*\.xml$
+	@denied_errors_xml path_regexp denied_errors_xml ^/errors/.*\.xml$
+	@denied_setup {
+		path /setup/*
+		not path /setup/pub/*
+	}
+	@denied_update {
+		path /update/*
+		not path /update/pub/*
+	}
+	respond @denied_paths 403
+	respond @denied_media_theme 403
+	respond @denied_pub_media 403
+	respond @denied_pub_media_theme 403
+	respond @denied_errors_xml 403
+	respond @denied_setup 403
+	respond @denied_update 403
+
+	# ─── Static assets with versioning rewrite ───
+	@static_versioned path_regexp static ^/static/version\d+/(.*)$
+	rewrite @static_versioned /static/{http.regexp.static.1}
+
+	@static_missing {
+		path /static/*
+		not file
+	}
+	rewrite @static_missing /static.php?resource={path}
+
+	@media_missing {
+		path /media/*
+		not file
+	}
+	rewrite @media_missing /get.php?{query}
+
+	# Cache headers for static assets
+	@cacheable path_regexp \.(ico|jpg|jpeg|png|gif|svg|js|css|swf|eot|ttf|otf|woff|woff2|html|json)$
+	header @cacheable {
+		Cache-Control "public, max-age=31536000"
+		X-Frame-Options "SAMEORIGIN"
+	}
+
+	@nocache path_regexp \.(zip|gz|gzip|bz2|csv|xml)$
+	header @nocache {
+		Cache-Control "no-store"
+		X-Frame-Options "SAMEORIGIN"
+	}
+
+	# ─── PHP entry points (whitelist) ───
+	@php_entrypoints path_regexp ^/(index|get|static|errors/report|errors/404|errors/503|health_check)\.php$
+	@setup_php path /setup/index.php
+	@update_php path /update/index.php
+	@mftf_php path /dev/tests/acceptance/utils/command.php
+
+	php_server @php_entrypoints
+	php_server @setup_php {
+		root /app
+	}
+	php_server @update_php {
+		root /app
+	}
+	php_server @mftf_php {
+		root /app
+	}
+
+	# ─── Block any other PHP / sensitive files ───
+	@banned {
+		path_regexp banned \.(php|phtml|htaccess)$|\.git
+		not path /index.php /get.php /static.php /errors/report.php /errors/404.php /errors/503.php /health_check.php /setup/index.php /update/index.php /dev/tests/acceptance/utils/command.php
+	}
+	respond @banned 403
+
+	# ─── Default handler ───
+	@root path /
+	rewrite @root /index.php?{query}
+	try_files {path} /index.php?{query}
+	php_server
+
+	# 404 fallback to Magento error page
+	handle_errors {
+		@404 expression {err.status_code} == 404
+		rewrite @404 /errors/404.php
+		php_server {
+			root /app/pub
+		}
+	}
+}

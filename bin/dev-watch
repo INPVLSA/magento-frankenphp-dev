@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Magento 2 dev-loop watcher
+#   - fswatch -> debounce -> classify file type
+#   - PHP/XML: SIGUSR2 to FrankenPHP (reload workers) + Mercure publish
+#   - phtml/css/less/js: Mercure publish only
+# Mercure topic: dev/reload   (subscribed by storefront snippet in dev mode)
+
+set -euo pipefail
+
+# ─── Config ────────────────────────────────────────────────────────────────
+CONTAINER="${CONTAINER:-frankenphp84}"
+PROJECT="${PROJECT:-248p3}"
+DEV_HOST="${DEV_HOST:-${PROJECT}.docker.loc}"
+MERCURE_URL="https://${DEV_HOST}/.well-known/mercure"
+JWT_KEY="${MERCURE_JWT_KEY:-!ChangeThisMercureHubJWTSecretKey!}"
+TOPIC="${MERCURE_TOPIC:-dev/reload}"
+DEBOUNCE_MS=300
+
+# Magento root = parent of bin/, regardless of where the script is called from.
+MAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WATCH_ROOTS=(
+  "${MAGE_ROOT}/app/code"
+  "${MAGE_ROOT}/app/design"
+)
+
+# ─── Dependency checks ─────────────────────────────────────────────────────
+missing=()
+command -v fswatch  >/dev/null || missing+=("fswatch (brew install fswatch)")
+command -v curl     >/dev/null || missing+=("curl")
+command -v docker   >/dev/null || missing+=("docker")
+command -v openssl  >/dev/null || missing+=("openssl")
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "Missing required tools:" >&2
+  printf '  - %s\n' "${missing[@]}" >&2
+  exit 1
+fi
+
+if ! docker ps --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
+  echo "Container '${CONTAINER}' is not running. Start it with:" >&2
+  echo "  docker compose -f docker-compose.frankenphp.yml up -d" >&2
+  exit 1
+fi
+
+# Filter out non-existent watch roots; warn if any are missing.
+existing=()
+for d in "${WATCH_ROOTS[@]}"; do
+  if [[ -d "$d" ]]; then existing+=("$d"); else echo "note: $d does not exist (yet), skipping" >&2; fi
+done
+if [[ ${#existing[@]} -eq 0 ]]; then
+  echo "No watchable directories. Aborting." >&2
+  exit 1
+fi
+
+# ─── JWT minting (HS256) ───────────────────────────────────────────────────
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+mint_jwt() {
+  local header payload sig
+  header=$(printf '{"alg":"HS256","typ":"JWT"}' | b64url)
+  payload=$(printf '{"mercure":{"publish":["*"]}}' | b64url)
+  sig=$(printf '%s.%s' "$header" "$payload" \
+        | openssl dgst -sha256 -hmac "$JWT_KEY" -binary | b64url)
+  printf '%s.%s.%s' "$header" "$payload" "$sig"
+}
+JWT="$(mint_jwt)"
+
+# ─── Actions ───────────────────────────────────────────────────────────────
+reload_worker() {
+  # FrankenPHP listens for SIGUSR1 on PID 1 to gracefully reload PHP workers
+  # (re-reads .php files and re-bootstraps). SIGUSR2 is NOT implemented and
+  # gets a "not implemented" log line. See bin/mage-worker for prior art.
+  docker exec "$CONTAINER" sh -c 'kill -USR1 1' >/dev/null 2>&1 \
+    && echo "  ↻ worker reloaded (SIGUSR1)" \
+    || echo "  ! worker reload failed" >&2
+}
+
+publish_reload() {
+  local kind="$1"
+  local payload
+  payload=$(printf '{"kind":"%s","ts":%s}' "$kind" "$(date +%s)")
+  curl -sk -o /dev/null -w "  → mercure %{http_code} ($kind)\n" \
+    -X POST "$MERCURE_URL" \
+    -H "Authorization: Bearer $JWT" \
+    --data-urlencode "topic=$TOPIC" \
+    --data-urlencode "data=$payload" \
+    || true
+}
+
+# ─── Debounce + dispatch loop ──────────────────────────────────────────────
+echo "watching:"
+printf '  %s\n' "${existing[@]}"
+echo "mercure: $MERCURE_URL  topic=$TOPIC"
+echo "container: $CONTAINER"
+echo
+
+# fswatch -x prints the path + event flags so we can ignore IsDir-only events.
+# --latency batches macOS FSEvents bursts; we still de-dupe in-shell.
+fswatch -x --latency=0.2 --event=Created --event=Updated --event=Removed --event=Renamed \
+        --exclude '\.swp$' --exclude '\.tmp$' --exclude '/\.git/' --exclude '/generated/' \
+        "${existing[@]}" \
+| while IFS= read -r line; do
+    # Line format: "<path> <FLAG1 FLAG2 ...>"
+    path="${line%% *}"
+    [[ -z "$path" ]] && continue
+
+    # Skip directory-only events.
+    case " $line " in *" IsDir "*) continue;; esac
+
+    ext="${path##*.}"
+    case "$ext" in
+      php|xml)        kind="php" ;;
+      phtml)          kind="phtml" ;;
+      css|less|js)    kind="asset" ;;
+      *)              continue ;;  # ignore everything else
+    esac
+
+    # Debounce: collapse bursts within DEBOUNCE_MS into one action per kind.
+    # macOS `date` has no %N; use python for millisecond precision.
+    # Per-kind scalars (no indirect expansion — works on bash 3.2 / system macOS bash).
+    now_ms=$(python3 -c 'import time;print(int(time.time()*1000))')
+    case "$kind" in
+      php)   last_val="${LAST_php_MS:-0}" ;;
+      phtml) last_val="${LAST_phtml_MS:-0}" ;;
+      asset) last_val="${LAST_asset_MS:-0}" ;;
+    esac
+    if (( now_ms - last_val < DEBOUNCE_MS )); then continue; fi
+    case "$kind" in
+      php)   LAST_php_MS=$now_ms ;;
+      phtml) LAST_phtml_MS=$now_ms ;;
+      asset) LAST_asset_MS=$now_ms ;;
+    esac
+
+    echo "[$(date +%H:%M:%S)] $kind  ${path#"$MAGE_ROOT/"}"
+    if [[ "$kind" == "php" ]]; then
+      reload_worker
+    fi
+    publish_reload "$kind"
+  done
