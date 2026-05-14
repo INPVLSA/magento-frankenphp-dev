@@ -14,7 +14,21 @@
 
 ignore_user_abort(true);
 
-require __DIR__ . '/../app/bootstrap.php';
+/**
+ * Resolve the Magento base path. This file is symlinked from the kit into the
+ * project's pub/ — under FrankenPHP, __DIR__ resolves to the symlink *target*
+ * (dev/franken/pub), not the symlink path (pub/), so __DIR__ . '/../app' is
+ * wrong. Walk up until we find app/etc/ to handle both layouts.
+ */
+$mageRoot = __DIR__;
+while ($mageRoot !== '/' && !is_dir($mageRoot . '/app/etc')) {
+    $mageRoot = dirname($mageRoot);
+}
+if ($mageRoot === '/') {
+    fwrite(STDERR, "[frankenphp-worker] cannot locate Magento root from " . __DIR__ . "\n");
+    exit(1);
+}
+require $mageRoot . '/app/bootstrap.php';
 
 use Magento\Framework\App\Bootstrap;
 use Magento\Framework\App\ObjectManager as AppObjectManager;
@@ -330,7 +344,7 @@ $workerPid = getmypid();
  * not in the container env. Read it directly — env.php is a simple
  * `return [...]` file, no Magento bootstrapping needed.
  */
-$envConfig = @include __DIR__ . '/../app/etc/env.php';
+$envConfig = @include $mageRoot . '/app/etc/env.php';
 $devMode = is_array($envConfig) && ($envConfig['MAGE_MODE'] ?? '') === 'developer';
 
 /**
