@@ -26,7 +26,7 @@ http://magento.loc {
 }
 
 magento.loc {
-	tls /etc/caddy/certs.d/magento.loc/ssl_certificate.cert /etc/caddy/certs.d/magento.loc/id_rsa.key
+	tls internal
 
 	root * /app/pub
 	encode zstd gzip
